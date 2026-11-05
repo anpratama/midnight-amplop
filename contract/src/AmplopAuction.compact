@@ -1,0 +1,408 @@
+pragma language_version 0.23;
+
+import CompactStandardLibrary;
+
+// ---------------------------------------------------------------------------
+// AmplopAuction — many independent sealed-bid FIRST-PRICE auctions in ONE
+// contract. ("Amplop" is Indonesian for "envelope": a sealed bid is an
+// envelope nobody opens until reveal day.)
+//
+// Flow per auction:
+//   1. createAuction — a seller registers an item (by descriptor hash), a
+//      reserve price, a per-bid deposit, and the two deadlines that split
+//      the commit and reveal windows.
+//   2. commitBid     — during the commit window a bidder seals a bid: the
+//      ledger stores only a commitment hash of (bidAmount, secret, bidder,
+//      auction). The amount and the secret never leave the bidder's device.
+//      A fixed deposit is recorded against the bid (ledger accounting).
+//   3. revealBid     — during the reveal window the bidder opens the bid.
+//      The circuit re-derives the commitment and rejects a mismatch. A
+//      reveal at or above the reserve is ELIGIBLE and can take the lead; a
+//      reveal below the reserve is recorded as ineligible — it still counts
+//      as revealed (so the deposit is not forfeited), it just cannot win.
+//   4. finalize      — after the reveal deadline the seller finalizes:
+//      the highest eligible revealed bid wins and — FIRST-PRICE — the
+//      winner pays exactly their own bid. Bidders who committed but never
+//      revealed forfeit their deposits to the seller. A receipt hash binding
+//      the auction parameters, outcome and counts is stored on the ledger.
+//   5. verifyReceipt — re-derives the outcome (winning bid, counts) from
+//      the ledger and checks a presented claim against the stored receipt.
+//
+// Privacy boundary (Midnight dual-ledger model):
+//   PUBLIC (ledger): auction definitions (item hash, reserve, deposit,
+//     deadlines, seller id hash), commitments (opaque hashes), COUNTS of
+//     committed/revealed bids, revealed amounts (a reveal is a public
+//     opening, exactly like a paper envelope being opened), the running
+//     highest eligible bid and the leader's id HASH, final results and
+//     receipt hashes.
+//   PRIVATE (bidder's device only): localSecretKey (witness), the bid
+//     amount before reveal, and the per-bid secret salt.
+//   A bidder's ledger identity is a one-way hash of their secret key, and
+//   non-winners are never linked to a plaintext identity by this contract.
+//   A bid that is never revealed stays sealed forever: its amount is known
+//   only to the bidder who placed it.
+//
+// Time model (Compact limitation, handled honestly):
+//   Compact circuits cannot READ the current time — the standard library
+//   only offers comparisons against block time (blockTimeLt/Gte), in
+//   seconds since the Unix epoch. So each auction stores its deadlines on
+//   the ledger, and commit/reveal/finalize PROVE their relation to those
+//   deadlines in-circuit:
+//     commit:   blockTime <  commitDeadline
+//     reveal:   commitDeadline <= blockTime < revealDeadline
+//     finalize: revealDeadline <= blockTime
+//   The contract cannot prove a deadline is "in the future" at creation
+//   time (it cannot read "now"), so createAuction only enforces
+//   commitDeadline < revealDeadline; enforcement happens at bid time.
+//
+// Highest-bid tracking (another Compact limitation, handled honestly):
+//   Compact circuits cannot iterate a Map, so the contract cannot rescan
+//   every revealed bid at finalize time. Instead the running highest
+//   eligible bid is updated IN-CIRCUIT at each reveal — a new leader is
+//   recorded only when an eligible reveal is STRICTLY greater than the
+//   current highest, which is also what makes the tie rule below exact.
+//   verifyReceipt then re-derives the outcome from these ledger counters
+//   and the receipt hash, exactly as finalize computed it.
+//
+// Tie rule: the FIRST revealed of two equal highest bids wins. A later
+// equal bid does not displace the leader (the update requires strictly
+// greater), so ties are settled by reveal order, deterministically.
+//
+// Forfeit rule: a bidder who commits but never reveals forfeits the full
+// deposit to the seller. Revealing — even below the reserve — never
+// forfeits. The winner's deposit is part of the contract's accounting:
+// amountDue is the winning bid itself (first-price); settlement wiring
+// against real tokens is the preprod step, not simulated here.
+// ---------------------------------------------------------------------------
+
+// One auction's public definition, counters and result. Stored as a Map
+// value so an auction can be updated in place (read struct, rebuild with
+// changed fields, insert).
+struct AuctionInfo {
+  sellerId: Bytes<32>,
+  itemHash: Bytes<32>,
+  reservePrice: Uint<64>,
+  depositAmount: Uint<64>,
+  commitDeadline: Uint<64>,
+  revealDeadline: Uint<64>,
+  finalized: Boolean,
+  committedCount: Uint<64>,
+  revealedCount: Uint<64>,
+  hasLeader: Boolean,
+  highestBid: Uint<64>,
+  leaderId: Bytes<32>,
+  hasWinner: Boolean,
+  winningBid: Uint<64>,
+  winnerId: Bytes<32>,
+  forfeitedCount: Uint<64>,
+  forfeitedAmount: Uint<64>
+}
+
+export ledger auctionCount: Uint<64>;
+export ledger auctions: Map<Bytes<32>, AuctionInfo>;
+// Keyed by bidKey(auctionId, bidderId) — see below.
+export ledger commitments: Map<Bytes<32>, Bytes<32>>;
+export ledger deposits: Map<Bytes<32>, Uint<64>>;
+// Revealed (opened) bid amounts, keyed by bidKey. Only successful reveals
+// land here; a bid that is never revealed never appears.
+export ledger revealedBids: Map<Bytes<32>, Uint<64>>;
+// auctionId -> outcome receipt hash, set by finalize.
+export ledger receipts: Map<Bytes<32>, Bytes<32>>;
+
+// Private input: every participant's secret key, kept on their own device.
+witness localSecretKey(): Bytes<32>;
+
+constructor() {
+  auctionCount = 0;
+}
+
+// Identity of a bidder: stable per secret key, reveals nothing about it.
+circuit bidderIdOf(secretKey: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "amplop:bidder:"), secretKey]);
+}
+
+// Public identifier of a seller, derived from their secret.
+circuit sellerIdOf(secret: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([pad(32, "amplop:seller:"), secret]);
+}
+
+// Sentinel stored as leader/winner id while an auction has no leader.
+circuit noBidder(): Bytes<32> {
+  return pad(32, "amplop:no-bidder:");
+}
+
+// Ledger key scoping one bidder's data to one auction.
+circuit bidKey(auctionId: Bytes<32>, bidder: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([auctionId, bidder]);
+}
+
+// The sealed-bid commitment: binds the amount, the bidder's one-time
+// secret, the bidder and the auction, and reveals none of them.
+circuit commitmentOf(
+  auctionId: Bytes<32>,
+  bidder: Bytes<32>,
+  bidAmount: Uint<64>,
+  secret: Bytes<32>
+): Bytes<32> {
+  return persistentHash<Vector<4, Bytes<32>>>([
+    persistentHash<Uint<64>>(bidAmount),
+    secret,
+    bidder,
+    auctionId
+  ]);
+}
+
+// The receipt hash binding an auction to its parameters, its first-price
+// outcome (winning bid + winner id) and its commit/reveal counts.
+circuit receiptOf(
+  auctionId: Bytes<32>,
+  info: AuctionInfo,
+  winningBid: Uint<64>,
+  winner: Bytes<32>
+): Bytes<32> {
+  const outcomeHash = persistentHash<Vector<2, Bytes<32>>>([
+    persistentHash<Uint<64>>(winningBid),
+    winner
+  ]);
+  const countsHash = persistentHash<Vector<2, Bytes<32>>>([
+    persistentHash<Uint<64>>(info.committedCount),
+    persistentHash<Uint<64>>(info.revealedCount)
+  ]);
+  const paramsHash = persistentHash<Vector<4, Bytes<32>>>([
+    info.sellerId,
+    persistentHash<Uint<64>>(info.reservePrice),
+    persistentHash<Uint<64>>(info.commitDeadline),
+    persistentHash<Uint<64>>(info.revealDeadline)
+  ]);
+  return persistentHash<Vector<4, Bytes<32>>>([
+    pad(32, "amplop:receipt:"),
+    auctionId,
+    outcomeHash,
+    persistentHash<Vector<2, Bytes<32>>>([countsHash, paramsHash])
+  ]);
+}
+
+// Register a new auction and return its auction id. The creator is the
+// seller: only their secret can finalize the auction. The id is unique
+// per (seller, creation order). The item itself is represented only by
+// the hash of its descriptor; the descriptor lives off-chain with the
+// seller.
+export circuit createAuction(
+  itemHash_: Bytes<32>,
+  reservePrice_: Uint<64>,
+  depositAmount_: Uint<64>,
+  commitDeadline_: Uint<64>,
+  revealDeadline_: Uint<64>,
+  sellerSecret: Bytes<32>
+): Bytes<32> {
+  assert(
+    commitDeadline_ < revealDeadline_,
+    "Commit deadline must be before reveal deadline"
+  );
+  const zero: Uint<64> = 0;
+  assert(depositAmount_ > zero, "Deposit must be positive");
+  const sId = sellerIdOf(sellerSecret);
+  const auctionId = disclose(persistentHash<Vector<2, Bytes<32>>>([
+    sId,
+    persistentHash<Uint<64>>(auctionCount)
+  ]));
+  const nobody = noBidder();
+  const info = AuctionInfo {
+    sellerId: disclose(sId),
+    itemHash: disclose(itemHash_),
+    reservePrice: disclose(reservePrice_),
+    depositAmount: disclose(depositAmount_),
+    commitDeadline: disclose(commitDeadline_),
+    revealDeadline: disclose(revealDeadline_),
+    finalized: false,
+    committedCount: zero,
+    revealedCount: zero,
+    hasLeader: false,
+    highestBid: zero,
+    leaderId: nobody,
+    hasWinner: false,
+    winningBid: zero,
+    winnerId: nobody,
+    forfeitedCount: zero,
+    forfeitedAmount: zero
+  };
+  auctions.insert(auctionId, info);
+  const one: Uint<64> = 1;
+  auctionCount = (auctionCount + one) as Uint<64>;
+  return auctionId;
+}
+
+// Seal a bid in an auction, during the commit window only. The ledger
+// records a commitment hash and the auction's fixed deposit against this
+// bidder; the amount and the secret stay private on the bidder's device.
+// One commitment per (auction, bidder).
+export circuit commitBid(auctionId: Bytes<32>, bidAmount: Uint<64>, secret: Bytes<32>): [] {
+  const aid = disclose(auctionId);
+  assert(auctions.member(aid), "No such auction");
+  const info = auctions.lookup(aid);
+  assert(!info.finalized, "Auction is finalized");
+  assert(blockTimeLt(info.commitDeadline), "Commit window has closed");
+  const zero: Uint<64> = 0;
+  assert(bidAmount > zero, "Bid must be positive");
+  const secretKey = localSecretKey();
+  const bidder = disclose(bidderIdOf(secretKey));
+  const key = bidKey(aid, bidder);
+  assert(!commitments.member(key), "Already committed");
+  commitments.insert(key, disclose(commitmentOf(aid, bidder, bidAmount, secret)));
+  deposits.insert(key, info.depositAmount);
+  const one: Uint<64> = 1;
+  const updated = AuctionInfo {
+    sellerId: info.sellerId,
+    itemHash: info.itemHash,
+    reservePrice: info.reservePrice,
+    depositAmount: info.depositAmount,
+    commitDeadline: info.commitDeadline,
+    revealDeadline: info.revealDeadline,
+    finalized: info.finalized,
+    committedCount: (info.committedCount + one) as Uint<64>,
+    revealedCount: info.revealedCount,
+    hasLeader: info.hasLeader,
+    highestBid: info.highestBid,
+    leaderId: info.leaderId,
+    hasWinner: info.hasWinner,
+    winningBid: info.winningBid,
+    winnerId: info.winnerId,
+    forfeitedCount: info.forfeitedCount,
+    forfeitedAmount: info.forfeitedAmount
+  };
+  auctions.insert(aid, updated);
+}
+
+// Open a previously sealed bid, during the reveal window only. The
+// circuit re-derives the commitment from (amount, secret, bidder,
+// auction) and rejects any mismatch — a wrong secret or a changed amount
+// fails. A verified reveal is recorded (and its deposit protected) even
+// when the amount is below the reserve; such a bid is INELIGIBLE and
+// cannot take the lead. An eligible reveal takes the lead only when it is
+// strictly greater than the current highest bid, so among equal highest
+// bids the first revealed wins.
+export circuit revealBid(auctionId: Bytes<32>, bidAmount: Uint<64>, secret: Bytes<32>): [] {
+  const aid = disclose(auctionId);
+  assert(auctions.member(aid), "No such auction");
+  const info = auctions.lookup(aid);
+  assert(!info.finalized, "Auction is finalized");
+  assert(blockTimeGte(info.commitDeadline), "Reveal window has not opened");
+  assert(blockTimeLt(info.revealDeadline), "Reveal window has closed");
+  const secretKey = localSecretKey();
+  const bidder = disclose(bidderIdOf(secretKey));
+  const key = bidKey(aid, bidder);
+  assert(commitments.member(key), "No bid to reveal");
+  assert(
+    commitments.lookup(key) == commitmentOf(aid, bidder, bidAmount, secret),
+    "Reveal does not match commitment"
+  );
+  assert(!revealedBids.member(key), "Already revealed");
+  // A reveal is a public opening: the amount crosses onto the ledger here
+  // by design, exactly like an envelope being opened.
+  const amount = disclose(bidAmount);
+  revealedBids.insert(key, amount);
+  const eligible = amount >= info.reservePrice;
+  const takesLead = eligible && (amount > info.highestBid);
+  const one: Uint<64> = 1;
+  const updated = AuctionInfo {
+    sellerId: info.sellerId,
+    itemHash: info.itemHash,
+    reservePrice: info.reservePrice,
+    depositAmount: info.depositAmount,
+    commitDeadline: info.commitDeadline,
+    revealDeadline: info.revealDeadline,
+    finalized: info.finalized,
+    committedCount: info.committedCount,
+    revealedCount: (info.revealedCount + one) as Uint<64>,
+    hasLeader: info.hasLeader || takesLead,
+    highestBid: takesLead ? amount : info.highestBid,
+    leaderId: takesLead ? bidder : info.leaderId,
+    hasWinner: info.hasWinner,
+    winningBid: info.winningBid,
+    winnerId: info.winnerId,
+    forfeitedCount: info.forfeitedCount,
+    forfeitedAmount: info.forfeitedAmount
+  };
+  auctions.insert(aid, updated);
+}
+
+// Finalize an auction once the reveal deadline has passed. Only the
+// seller can finalize. FIRST-PRICE: the winner is the highest eligible
+// revealed bid and pays exactly that bid. Committed-but-unrevealed bids
+// are counted as forfeits (count x deposit, owed to the seller). Stores
+// and returns the outcome receipt.
+export circuit finalize(auctionId: Bytes<32>, sellerSecret: Bytes<32>): Bytes<32> {
+  const aid = disclose(auctionId);
+  assert(auctions.member(aid), "No such auction");
+  const info = auctions.lookup(aid);
+  assert(sellerIdOf(sellerSecret) == info.sellerId, "Not the seller");
+  assert(blockTimeGte(info.revealDeadline), "Reveal window is still open");
+  assert(!info.finalized, "Auction is already finalized");
+  const zero: Uint<64> = 0;
+  const winBid: Uint<64> = info.hasLeader ? info.highestBid : zero;
+  const winner: Bytes<32> = info.hasLeader ? info.leaderId : noBidder();
+  const forfeits = (info.committedCount - info.revealedCount) as Uint<64>;
+  const forfeitTotal = (forfeits * info.depositAmount) as Uint<64>;
+  const receipt = disclose(receiptOf(aid, info, winBid, winner));
+  receipts.insert(aid, receipt);
+  const updated = AuctionInfo {
+    sellerId: info.sellerId,
+    itemHash: info.itemHash,
+    reservePrice: info.reservePrice,
+    depositAmount: info.depositAmount,
+    commitDeadline: info.commitDeadline,
+    revealDeadline: info.revealDeadline,
+    finalized: true,
+    committedCount: info.committedCount,
+    revealedCount: info.revealedCount,
+    hasLeader: info.hasLeader,
+    highestBid: info.highestBid,
+    leaderId: info.leaderId,
+    hasWinner: info.hasLeader,
+    winningBid: winBid,
+    winnerId: winner,
+    forfeitedCount: forfeits,
+    forfeitedAmount: forfeitTotal
+  };
+  auctions.insert(aid, updated);
+  return receipt;
+}
+
+// Check a presented outcome against an auction's stored receipt. Succeeds
+// (and returns true) only if the claimed winning bid equals the winning
+// bid re-derived from the ledger state, the claimed counts match, and the
+// receipt hash recomputed from the claim equals the stored receipt. Any
+// mismatch fails the circuit — a forged outcome has no valid receipt. For
+// an auction with no winner, the honest winning-bid claim is 0.
+export circuit verifyReceipt(
+  auctionId: Bytes<32>,
+  winningBid: Uint<64>,
+  committedCount: Uint<64>,
+  revealedCount: Uint<64>
+): Boolean {
+  const aid = disclose(auctionId);
+  assert(auctions.member(aid), "No such auction");
+  assert(receipts.member(aid), "Auction is not finalized");
+  const info = auctions.lookup(aid);
+  const zero: Uint<64> = 0;
+  const derivedBid: Uint<64> = info.hasLeader ? info.highestBid : zero;
+  const derivedWinner: Bytes<32> = info.hasLeader ? info.leaderId : noBidder();
+  assert(disclose(winningBid) == derivedBid, "Winning bid does not match the ledger");
+  assert(disclose(committedCount) == info.committedCount, "Commit count does not match");
+  assert(disclose(revealedCount) == info.revealedCount, "Reveal count does not match");
+  assert(
+    receiptOf(aid, info, derivedBid, derivedWinner) == receipts.lookup(aid),
+    "Receipt does not match"
+  );
+  return true;
+}
+
+// The current highest eligible revealed bid in an auction (0 while no
+// eligible bid has been revealed). Read straight from the ledger.
+export circuit getHighestBid(auctionId: Bytes<32>): Uint<64> {
+  const aid = disclose(auctionId);
+  assert(auctions.member(aid), "No such auction");
+  const info = auctions.lookup(aid);
+  const zero: Uint<64> = 0;
+  return info.hasLeader ? info.highestBid : zero;
+}
